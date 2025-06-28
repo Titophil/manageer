@@ -1,74 +1,36 @@
-from flask import Blueprint, jsonify, send_file
+from flask import Blueprint, request, jsonify
+from models import db, HealthRecord, Appointment
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from models import db, HealthRecord, User, Appointment
-import subprocess
-import os
 
-health_record_bp = Blueprint('health_record', __name__)
+health_bp = Blueprint('health_bp', __name__)
 
-@health_record_bp.route('/health_records', methods=['GET'])
+@health_bp.route('/', methods=['POST'])
 @jwt_required()
-def get_health_records():
-    identity = get_jwt_identity()
-    user = User.query.filter_by(username=identity['username']).first()
-    
-    if identity['role'] == 'patient':
-        records = HealthRecord.query.filter_by(patient_id=user.id).all()
-    elif identity['role'] == 'doctor':
-        appointments = Appointment.query.filter_by(doctor_id=user.id).all()
-        patient_ids = {appt.patient_id for appt in appointments}
-        records = HealthRecord.query.filter(HealthRecord.patient_id.in_(patient_ids)).all()
-    elif identity['role'] == 'admin':
-        records = HealthRecord.query.all()
-    else:
-        return jsonify({"error": "Invalid role"}), 403
-    
-    return jsonify([
-        {
-            'id': record.id,
-            'patient': record.patient.username,
-            'condition': record.condition,
-            'recorded_at': record.recorded_at.isoformat()
-        } for record in records
-    ]), 200
+def create_health_record():
+    data = request.get_json()
+    current_user_identity = get_jwt_identity()
 
-@health_record_bp.route('/health_records/<int:id>/pdf', methods=['GET'])
+    if current_user_identity['role'] != 'doctor':
+        return jsonify({'message': 'Only doctors can create health records'}), 403
+
+    appointment = Appointment.query.get(data['appointment_id'])
+    if not appointment or appointment.doctor_id != current_user_identity['id']:
+        return jsonify({'message': 'Appointment not found or not assigned to this doctor'}), 404
+
+    new_record = HealthRecord(
+        appointment_id=data['appointment_id'],
+        doctor_notes=data['doctor_notes']
+    )
+    db.session.add(new_record)
+    db.session.commit()
+    return jsonify({'message': 'Health record created successfully', 'id': new_record.id}), 201
+
+@health_bp.route('/appointment/<int:appointment_id>', methods=['GET'])
 @jwt_required()
-def download_health_record_pdf(id):
-    identity = get_jwt_identity()
-    user = User.query.filter_by(username=identity['username']).first()
-    record = HealthRecord.query.get_or_404(id)
-    
-    if identity['role'] == 'patient' and record.patient_id != user.id:
-        return jsonify({"error": "Unauthorized access"}), 403
-    
-    latex_content = f"""
-    \\documentclass{{article}}
-    \\usepackage{{geometry}}
-    \\geometry{{margin=1in}}
-    \\usepackage{{noto}}
-    \\begin{{document}}
-    \\title{{Health Record}}
-    \\author{{Smart Clinic Manager}}
-    \\maketitle
-    \\section{{Patient Health Record}}
-    \\textbf{{Patient:}} {record.patient.username}\\\\
-    \\textbf{{Condition:}} {record.condition}\\\\
-    \\textbf{{Recorded At:}} {record.recorded_at.strftime('%Y-%m-%d %H:%M')}\\\\
-    \\end{{document}}
-    """
-    
-    tex_file = f"/tmp/health_record_{id}.tex"
-    with open(tex_file, 'w') as f:
-        f.write(latex_content)
-    
-    try:
-        subprocess.run(['latexmk', '-pdf', tex_file], check=True, cwd='/tmp')
-    except subprocess.CalledProcessError:
-        return jsonify({"error": "PDF generation failed"}), 500
-    
-    pdf_file = f"/tmp/health_record_{id}.pdf"
-    if os.path.exists(pdf_file):
-        return send_file(pdf_file, as_attachment=True, download_name=f"health_record_{id}.pdf")
-    
-    return jsonify({"error": "PDF file not found"}), 500
+def get_health_record(appointment_id):
+    record = HealthRecord.query.filter_by(appointment_id=appointment_id).first_or_404()
+    return jsonify({
+        'id': record.id,
+        'appointment_id': record.appointment_id,
+        'doctor_notes': record.doctor_notes
+    }), 200
